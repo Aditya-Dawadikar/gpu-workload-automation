@@ -1,0 +1,53 @@
+# Copy to terraform.tfvars and edit.
+
+region       = "us-east-1"
+cluster_name = "gpu-cluster"
+
+# REQUIRED: who may reach SSH / Ray dashboard / Grafana / Prometheus.
+# A single IP needs /32. Find yours with:  curl -s https://checkip.amazonaws.com
+allowed_cidrs = ["203.0.113.7/32"]
+
+# Optional: use an existing SSH key. Leave commented out to have Terraform
+# generate one (private key saved to terraform/.keys/<cluster_name>.pem).
+# ssh_public_key_path = "~/.ssh/id_ed25519.pub"
+
+# GPU workers
+worker_count         = 2
+worker_instance_type = "g4dn.xlarge" # 1x NVIDIA T4
+worker_use_spot      = false
+
+# GPU instance types (x86_64 only; Graviton types like g5g won't work with this AMI).
+# Instance type   GPUs   NVIDIA GPU   GPU memory (each)  vCPUs  Use case
+# ---- G4dn (Turing) ---------------------------------------------------------
+#   g4dn.xlarge     1    T4           16 GB               4     cheapest, dev/inference
+#   g4dn.2xlarge    1    T4           16 GB               8
+#   g4dn.12xlarge   4    T4           16 GB              48
+#   g4dn.metal      8    T4           16 GB              96
+# ---- G5 (Ampere) -----------------------------------------------------------
+#   g5.xlarge       1    A10G         24 GB               4     inference, small training
+#   g5.2xlarge      1    A10G         24 GB               8
+#   g5.12xlarge     4    A10G         24 GB              48
+#   g5.48xlarge     8    A10G         24 GB             192
+# ---- G6 (Ada Lovelace) -----------------------------------------------------
+#   g6.xlarge       1    L4           24 GB               4     cost-efficient inference
+#   g6.12xlarge     4    L4           24 GB              48
+#   g6.48xlarge     8    L4           24 GB             192
+# ---- G6e (Ada Lovelace) ----------------------------------------------------
+#   g6e.xlarge      1    L40S         48 GB               4     LLM inference, fine-tuning
+#   g6e.12xlarge    4    L40S         48 GB              48
+#   g6e.48xlarge    8    L40S         48 GB             192
+# ---- P4 (Ampere) -----------------------------------------------------------
+#   p4d.24xlarge    8    A100         40 GB              96     large-scale training
+#   p4de.24xlarge   8    A100         80 GB              96
+# ---- P5 (Hopper) -----------------------------------------------------------
+#   p5.48xlarge     8    H100         80 GB             192     frontier training
+#   p5e.48xlarge    8    H200        141 GB             192
+#   p5en.48xlarge   8    H200        141 GB             192
+# Total GPUs = worker_count x GPUs per instance. Check your EC2 vCPU quota first:
+# "Running On-Demand G and VT instances" covers G types, "Running On-Demand P instances" covers P types.
+# Not every type is offered in every region/AZ; P4/P5 often need a capacity reservation.
+
+# Head node (CPU only)
+head_instance_type = "m5.xlarge"
+
+ray_version = "2.40.0"

@@ -1,0 +1,102 @@
+#!/bin/bash
+# Ray head bootstrap (rendered by Terraform).
+#   Full trace : /var/log/ray-bootstrap.log
+#   Step status: /var/log/ray-bootstrap.status  (streamed by scripts/deploy.sh)
+set -Eeuxo pipefail
+exec > >(tee -a /var/log/ray-bootstrap.log) 2>&1
+
+${bootstrap_lib}
+
+export DEBIAN_FRONTEND=noninteractive
+APT="apt-get -o DPkg::Lock::Timeout=600 -y"
+
+step "Install system packages"
+$APT update
+$APT install python3-venv python3-pip curl ca-certificates
+
+step "Install Docker"
+if ! command -v docker >/dev/null; then
+  curl -fsSL https://get.docker.com | sh
+fi
+systemctl enable --now docker
+usermod -aG docker ubuntu
+docker version
+
+step "Install Ray ${ray_version}"
+python3 -m venv /opt/ray/venv
+/opt/ray/venv/bin/pip install --upgrade pip
+# click>=8.2 breaks the CLI of older Ray releases ("is not a valid Sentinel").
+/opt/ray/venv/bin/pip install "ray[default]==${ray_version}" "click<8.2"
+chown -R ubuntu:ubuntu /opt/ray
+echo 'export PATH=/opt/ray/venv/bin:$PATH' > /etc/profile.d/ray.sh
+/opt/ray/venv/bin/ray --version
+
+step "Start Ray head"
+IMDS_TOKEN=$(curl -sfX PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+PUBLIC_IP=$(curl -sf -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)
+
+# Ray dashboard embeds Grafana panels; the iframe host must be reachable from
+# the operator's browser, hence the public IP.
+mkdir -p /etc/ray
+cat > /etc/ray/ray.env <<EOF
+RAY_GRAFANA_HOST=http://127.0.0.1:3000
+RAY_GRAFANA_IFRAME_HOST=http://$PUBLIC_IP:3000
+RAY_PROMETHEUS_HOST=http://127.0.0.1:9090
+RAY_PROMETHEUS_NAME=Prometheus
+EOF
+
+cat > /etc/systemd/system/ray-head.service <<'EOF'
+[Unit]
+Description=Ray head node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+EnvironmentFile=/etc/ray/ray.env
+ExecStart=/opt/ray/venv/bin/ray start --head --block \
+  --port=6379 \
+  --dashboard-host=0.0.0.0 --dashboard-port=8265 \
+  --metrics-export-port=8080 ${head_num_cpus}
+ExecStop=/opt/ray/venv/bin/ray stop
+Restart=always
+RestartSec=10
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now ray-head
+wait_for 180 "Ray GCS on port 6379" bash -c "</dev/tcp/127.0.0.1/6379" \
+  || { journalctl -u ray-head --no-pager -n 80; false; }
+
+step "Wait for Ray dashboard"
+wait_for 180 "Ray dashboard on port 8265" curl -sf http://127.0.0.1:8265 \
+  || { journalctl -u ray-head --no-pager -n 80; false; }
+
+step "Publish Ray Grafana dashboards"
+# Ray generates its own Grafana dashboards on start; publish them to Grafana.
+RAY_DASHBOARDS=/tmp/ray/session_latest/metrics/grafana/dashboards
+wait_for 120 "Ray-generated dashboards in $RAY_DASHBOARDS" test -d "$RAY_DASHBOARDS"
+mkdir -p /opt/observability/grafana/dashboards/ray
+cp "$RAY_DASHBOARDS"/*.json /opt/observability/grafana/dashboards/ray/
+ls /opt/observability/grafana/dashboards/ray
+
+step "Start Prometheus, Grafana and node_exporter"
+cd /opt/observability
+docker compose pull
+docker compose up -d
+docker compose ps
+
+step "Verify observability stack"
+wait_for 120 "Prometheus ready on :9090" curl -sf http://127.0.0.1:9090/-/ready \
+  || { docker compose logs --no-color --tail 80 prometheus; false; }
+wait_for 120 "Grafana healthy on :3000" curl -sf http://127.0.0.1:3000/api/health \
+  || { docker compose logs --no-color --tail 80 grafana; false; }
+wait_for 60 "node_exporter on :9100" curl -sf http://127.0.0.1:9100/metrics \
+  || { docker compose logs --no-color --tail 80 node-exporter; false; }
+
+bootstrap_done
+echo "Ray head bootstrap complete"

@@ -1,0 +1,55 @@
+# Prometheus config (rendered by Terraform).
+# Workers are discovered through the EC2 API by their RayCluster tag, so
+# adding or replacing nodes needs no config change.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  external_labels:
+    ray_cluster: ${cluster_name}
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+
+  # Ray system + application metrics from every node in the cluster.
+  # The head keeps this file up to date as nodes join and leave.
+  - job_name: ray
+    file_sd_configs:
+      - files: ["/tmp/ray/prom_metrics_service_discovery.json"]
+
+  # Host metrics (CPU, memory, disk, network) from every node.
+  - job_name: node
+    ec2_sd_configs:
+      - region: ${region}
+        port: 9100
+        refresh_interval: 10s
+        filters:
+          - name: tag:RayCluster
+            values: ["${cluster_name}"]
+          - name: instance-state-name
+            values: ["running"]
+    relabel_configs: &ec2_labels
+      - source_labels: [__meta_ec2_tag_Name]
+        target_label: instance
+      - source_labels: [__meta_ec2_tag_RayNodeType]
+        target_label: node_type
+      - source_labels: [__meta_ec2_instance_type]
+        target_label: instance_type
+      - source_labels: [__meta_ec2_private_ip]
+        target_label: private_ip
+
+  # GPU metrics from NVIDIA DCGM exporter on GPU workers.
+  - job_name: dcgm
+    ec2_sd_configs:
+      - region: ${region}
+        port: 9400
+        refresh_interval: 30s
+        filters:
+          - name: tag:RayCluster
+            values: ["${cluster_name}"]
+          - name: tag:RayNodeType
+            values: ["worker"]
+          - name: instance-state-name
+            values: ["running"]
+    relabel_configs: *ec2_labels

@@ -1,0 +1,82 @@
+#!/bin/bash
+# Ray GPU worker bootstrap (rendered by Terraform).
+#   Full trace : /var/log/ray-bootstrap.log
+#   Step status: /var/log/ray-bootstrap.status  (streamed by scripts/deploy.sh)
+set -Eeuxo pipefail
+exec > >(tee -a /var/log/ray-bootstrap.log) 2>&1
+
+${bootstrap_lib}
+
+HEAD_IP="${head_ip}"
+export DEBIAN_FRONTEND=noninteractive
+APT="apt-get -o DPkg::Lock::Timeout=600 -y"
+
+step "Wait for NVIDIA driver"
+# The Deep Learning AMI loads the driver during boot.
+wait_for 300 "nvidia-smi to succeed" nvidia-smi \
+  || { dmesg | grep -i nvidia | tail -40; false; }
+nvidia-smi
+nvidia-smi -L
+
+step "Install system packages"
+$APT update
+$APT install python3-venv python3-pip
+
+step "Start GPU + host metrics exporters"
+systemctl enable --now docker
+docker rm -f node-exporter dcgm-exporter 2>/dev/null || true
+
+docker run -d --name node-exporter --restart unless-stopped \
+  --net host --pid host \
+  -v /:/host:ro,rslave \
+  ${node_exporter_image} --path.rootfs=/host
+
+docker run -d --name dcgm-exporter --restart unless-stopped \
+  --net host --gpus all --cap-add SYS_ADMIN \
+  ${dcgm_exporter_image}
+
+wait_for 60 "node_exporter on :9100" curl -sf http://127.0.0.1:9100/metrics \
+  || { docker logs --tail 80 node-exporter; false; }
+wait_for 180 "DCGM exporter reporting GPU metrics on :9400" \
+  bash -c "curl -sf http://127.0.0.1:9400/metrics | grep -q DCGM_FI_DEV_GPU_UTIL" \
+  || { docker logs --tail 80 dcgm-exporter; false; }
+
+step "Install Ray ${ray_version}"
+python3 -m venv /opt/ray/venv
+/opt/ray/venv/bin/pip install --upgrade pip
+# click>=8.2 breaks the CLI of older Ray releases ("is not a valid Sentinel").
+/opt/ray/venv/bin/pip install "ray[default]==${ray_version}" "click<8.2"
+chown -R ubuntu:ubuntu /opt/ray
+echo 'export PATH=/opt/ray/venv/bin:$PATH' > /etc/profile.d/ray.sh
+/opt/ray/venv/bin/ray --version
+
+step "Wait for Ray head at $HEAD_IP:6379"
+wait_for 1800 "Ray head GCS at $HEAD_IP:6379" bash -c "</dev/tcp/$HEAD_IP/6379"
+
+step "Join Ray cluster"
+cat > /etc/systemd/system/ray-worker.service <<EOF
+[Unit]
+Description=Ray GPU worker node
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+ExecStart=/opt/ray/venv/bin/ray start --block --address=$HEAD_IP:6379 --metrics-export-port=8080
+ExecStop=/opt/ray/venv/bin/ray stop
+Restart=always
+RestartSec=10
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now ray-worker
+wait_for 180 "ray-worker to connect to the head" \
+  bash -c "journalctl -u ray-worker --no-pager | grep -q 'Ray runtime started'" \
+  || { journalctl -u ray-worker --no-pager -n 80; false; }
+
+bootstrap_done
+echo "Ray worker bootstrap complete"
