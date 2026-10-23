@@ -1,0 +1,3 @@
+# Scripts are copied to Linux nodes; keep LF line endings on every checkout.
+*.sh text eol=lf
+*.py text eol=lf

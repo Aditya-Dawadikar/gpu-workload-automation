@@ -1,0 +1,8 @@
+# Merged by docker compose into the gpu-workers stack in /opt/observability
+# (installed as docker-compose.override.yml by remote/start-tempo.sh).
+# Grafana opens traces in Explore, which it gives only to editors by default;
+# let the anonymous viewers - already limited to allowed_cidrs - use it too.
+services:
+  grafana:
+    environment:
+      GF_USERS_VIEWERS_CAN_EDIT: "true"

@@ -1,0 +1,15 @@
+# Grafana datasource for the Tempo instance next to it on the head.
+# Installed by remote/start-tempo.sh into /opt/observability/grafana/provisioning/datasources.
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://127.0.0.1:3200
+    jsonData:
+      nodeGraph:
+        enabled: true
+      search:
+        hide: false
