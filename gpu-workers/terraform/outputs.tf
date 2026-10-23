@@ -38,6 +38,11 @@ output "prometheus_url" {
   value = "http://${aws_instance.head.public_ip}:9090"
 }
 
+output "llm_api_url" {
+  description = "OpenAI-compatible base URL once a model is deployed with ../llm-deployment."
+  value       = "http://${aws_instance.head.public_ip}:8000/v1"
+}
+
 output "grafana_admin_password" {
   value     = random_password.grafana_admin.result
   sensitive = true

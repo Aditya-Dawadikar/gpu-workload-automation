@@ -73,6 +73,7 @@ A cold start usually takes 8–15 minutes, mostly from the Deep Learning AMI boo
 | `http://<head>:3000` | Grafana home page = **GPU Cluster Overview**. Login `admin` / `terraform -chdir=terraform output -raw grafana_admin_password`. Anonymous users get read-only access (only from `allowed_cidrs`). |
 | `http://<head>:8265` | Ray dashboard: nodes, jobs, actors, logs. Its *Metrics* tab embeds Grafana. |
 | `http://<head>:9090` | Prometheus: raw metrics and target health (*Status → Targets*). |
+| `http://<head>:8000` | Ray Serve HTTP: the OpenAI-compatible LLM API, once you deploy a model with [`../llm-deployment`](../llm-deployment/README.md). |
 
 The **GPU Cluster Overview** dashboard has a `Node` filter and shows:
 
@@ -157,7 +158,7 @@ To dig into a node at any time:
 
 ## Security notes
 
-- Only the CIDRs in `allowed_cidrs` can reach the head's public ports; nodes can talk to each other on any port.
+- Only the CIDRs in `allowed_cidrs` can reach the head's public ports (22, 3000, 8000, 8265, 9090); nodes can talk to each other on any port.
 - A generated SSH private key is also stored in Terraform state, as is the Grafana admin password.
   The password is in the head's user_data too.
   Treat both as secrets, and use a remote encrypted state backend for shared use.

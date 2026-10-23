@@ -31,7 +31,7 @@ variable "vpc_cidr" {
 }
 
 variable "allowed_cidrs" {
-  description = "CIDRs allowed to reach SSH, the Ray dashboard, Grafana and Prometheus. Set this to your own IP, e.g. [\"203.0.113.7/32\"]."
+  description = "CIDRs allowed to reach SSH, the Ray dashboard, Grafana, Prometheus and the Ray Serve API. Set this to your own IP, e.g. [\"203.0.113.7/32\"]."
   type        = list(string)
 
   validation {

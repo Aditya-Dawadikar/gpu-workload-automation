@@ -1,0 +1,32 @@
+# Grafana Tempo on the Ray head: stores the LLM request traces that the Serve
+# replicas send over OTLP. Single binary, local disk, 24h retention.
+# Installed and started by remote/start-tempo.sh (from scripts/deploy.sh).
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200   # query API; Grafana reads it, not opened to the internet
+  grpc_listen_port: 9096
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317   # replicas on the GPU workers export here
+        http:
+          endpoint: 0.0.0.0:4318
+
+ingester:
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    block_retention: 24h
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
