@@ -89,6 +89,7 @@ locals {
     grafana       = 3000
     ray_dashboard = 8265
     prometheus    = 9090
+    ray_serve     = 8000 # Ray Serve HTTP (OpenAI-compatible API from ../llm-deployment)
   }
 
   operator_rules = {
