@@ -16,6 +16,14 @@ exports on every node's metrics port (:8080) as ray_llm_* series. Prometheus
 on the head already scrapes that port; the "LLM Serving" Grafana dashboard
 reads them.
 
+Native vLLM metrics: vLLM also registers its own vllm:* metrics in the
+replica's prometheus_client registry. Each replica serves that registry on
+its node's private IP at port metrics_port_base + its first GPU index (so
+replicas sharing a node never collide), together with a few llm_serve_*
+series: the replica's identity (read by remote/vllm_metrics_sd.py on the
+head to build Prometheus targets), request arrivals, responses by status and
+its capacity limits. The "vLLM Engine" Grafana dashboard reads them.
+
 Tracing: with an otlp_endpoint (deploy.sh points it at Tempo on the head),
 every request becomes a trace - the server span (child of the caller's W3C
 traceparent header, if sent), prompt preparation, generation, and vLLM's own
@@ -117,6 +125,88 @@ class RayStatLogger:
         pass
 
 
+class ReplicaMetrics:
+    """The replica's own Prometheus endpoint: vLLM's vllm:* metrics plus llm_serve_*.
+
+    vLLM 0.6.6 registers vllm:* in prometheus_client's default registry but
+    serves it only from its own OpenAI server, which Ray Serve doesn't use;
+    this serves the same registry. It binds the node's private IP: the cluster
+    security group lets only other cluster nodes reach that port.
+
+    Labels stay bounded: model_name, route and status code, never anything
+    taken from a request's content or caller.
+    """
+
+    PORT_SLOTS = 8          # ports metrics_port_base .. +7: one per GPU index on a node
+    BIND_RETRY_S = 30       # a replaced replica on the same GPU may still hold the port
+
+    def __init__(self, port_base: int, model: str, replica: str, application: str,
+                 deployment: str, engine, max_ongoing_requests: int):
+        import prometheus_client
+        import ray
+
+        prometheus_client.disable_created_metrics()   # as vLLM does: no *_created series
+        self.model = model
+        self.gpu_ids = sorted((g.strip() for g in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+                               if g.strip().isdigit()), key=int)
+        self.port = self._serve(prometheus_client, ray.util.get_node_ip_address(), port_base)
+
+        labels = {"model_name": model}
+        info = prometheus_client.Gauge(
+            "llm_serve_replica_info", "Identity of this Ray Serve replica (always 1)",
+            ["model_name", "replica_id", "serve_application", "serve_deployment", "gpu_ids", "vllm_version"])
+        import vllm
+        info.labels(model, replica, application, deployment, ",".join(self.gpu_ids) or "none",
+                    getattr(vllm, "__version__", "unknown")).set(1)
+
+        def limit(name, doc, value):
+            if value is not None:
+                prometheus_client.Gauge(name, doc, ["model_name"]).labels(**labels).set(value)
+
+        llm = engine.engine
+        cache = llm.cache_config
+        limit("llm_serve_max_ongoing_requests",
+              "Ray Serve max_ongoing_requests: requests this replica accepts at once", max_ongoing_requests)
+        limit("llm_serve_max_num_seqs", "vLLM max_num_seqs: sequences the engine runs in one batch",
+              getattr(llm.scheduler_config, "max_num_seqs", None))
+        limit("llm_serve_max_num_batched_tokens", "vLLM max_num_batched_tokens: token budget of one engine step",
+              getattr(llm.scheduler_config, "max_num_batched_tokens", None))
+        if cache.num_gpu_blocks and cache.block_size:
+            limit("llm_serve_kv_cache_capacity_tokens", "Tokens the GPU KV cache holds when full",
+                  cache.num_gpu_blocks * cache.block_size)
+
+        self.received = prometheus_client.Counter(
+            "llm_serve_requests_received", "API requests that reached this replica (counted on arrival)",
+            ["model_name", "route"])
+        self.responses = prometheus_client.Counter(
+            "llm_serve_responses", "API requests answered by this replica, by HTTP status (499: client went away)",
+            ["model_name", "route", "code"])
+
+    def _serve(self, prometheus_client, host: str, port_base: int) -> int:
+        """Binds base + first GPU index; without GPU ids, the first free port in the range."""
+        slots = range(port_base, port_base + self.PORT_SLOTS)
+        if self.gpu_ids and int(self.gpu_ids[0]) < self.PORT_SLOTS:
+            candidates, deadline = [port_base + int(self.gpu_ids[0])], time.monotonic() + self.BIND_RETRY_S
+        else:
+            candidates, deadline = list(slots), 0
+        while True:
+            for port in candidates:
+                try:
+                    prometheus_client.start_http_server(port, addr=host)
+                    return port
+                except OSError:
+                    continue
+            if time.monotonic() >= deadline:
+                raise OSError("no free metrics port among %s on %s" % (candidates, host))
+            time.sleep(2)
+
+    def request(self, route: str) -> None:
+        self.received.labels(self.model, route).inc()
+
+    def response(self, route: str, status: int) -> None:
+        self.responses.labels(self.model, route, str(status)).inc()
+
+
 def _replica_id() -> str:
     try:
         context = serve.get_replica_context()
@@ -124,6 +214,15 @@ def _replica_id() -> str:
         return getattr(replica_id, "unique_id", None) or str(getattr(context, "replica_tag", "replica"))
     except Exception:
         return uuid.uuid4().hex[:8]
+
+
+def _serve_names() -> "tuple[str, str]":
+    """(application, deployment) of this replica, from Serve's replica context."""
+    context = serve.get_replica_context()
+    deployment_id = getattr(getattr(context, "replica_id", None), "deployment_id", None)
+    app = getattr(context, "app_name", None) or getattr(deployment_id, "app_name", None) or "unknown"
+    deployment = getattr(context, "deployment", None) or getattr(deployment_id, "name", None) or "unknown"
+    return str(app), str(deployment)
 
 
 def _tracer(endpoint: str):
@@ -158,7 +257,7 @@ class RequestTrace:
            `- llm_request           vLLM's span: queue time, time to first token, e2e
     """
 
-    def __init__(self, tracer, route: str, headers, attributes: Dict[str, Any]):
+    def __init__(self, tracer, route: str, headers, attributes: Dict[str, Any], on_finish=None):
         from opentelemetry import trace
         from opentelemetry.trace import Status, StatusCode
         from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
@@ -173,6 +272,7 @@ class RequestTrace:
         self.first_token: Optional[float] = None
         self.last = None   # latest RequestOutput from vLLM
         self.ended = False
+        self.on_finish = on_finish   # called with the final HTTP status
 
     @property
     def trace_id(self) -> str:
@@ -208,6 +308,8 @@ class RequestTrace:
         if self.ended:
             return
         self.ended = True
+        if self.on_finish is not None:
+            self.on_finish(status)
         attributes: Dict[str, Any] = {"http.response.status_code": status}
         if self.last is not None:
             attributes["gen_ai.usage.output_tokens"] = sum(len(o.token_ids) for o in self.last.outputs)
@@ -239,7 +341,7 @@ class APIError(Exception):
 @serve.ingress(api)
 class LLMServer:
     def __init__(self, model: str, served_model_name: str, engine_args: Dict[str, Any],
-                 otlp_endpoint: str = ""):
+                 otlp_endpoint: str = "", metrics_port_base: int = 0, max_ongoing_requests: int = 0):
         from transformers import AutoTokenizer
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.engine.async_llm_engine import AsyncLLMEngine
@@ -256,6 +358,8 @@ class LLMServer:
                              ("llm.model", served_model_name)))
             engine_args = {**engine_args, "otlp_traces_endpoint": otlp_endpoint}
 
+        # vLLM labels its vllm:* metrics with model_name = the served name.
+        engine_args = {"served_model_name": served_model_name, **engine_args}
         logger.info("Starting vLLM for %s with %s", model, engine_args)
         self.engine = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(model=model, **engine_args))
         self.max_model_len = self.engine.engine.model_config.max_model_len
@@ -268,6 +372,17 @@ class LLMServer:
             self.engine.engine.add_logger("ray_metrics", RayStatLogger(served_model_name, self.replica))
         except Exception:  # serving matters more than metrics
             logger.exception("Could not attach the metrics logger; ray_llm_* metrics are disabled")
+        self.metrics: Optional[ReplicaMetrics] = None
+        if metrics_port_base:
+            # After the engine starts: with --tp > 1, vLLM sets CUDA_VISIBLE_DEVICES then.
+            try:
+                app, deployment = _serve_names()
+                self.metrics = ReplicaMetrics(metrics_port_base, served_model_name, self.replica, app,
+                                              deployment, self.engine, max_ongoing_requests)
+                logger.info("Serving vLLM metrics on port %d (GPUs %s)", self.metrics.port,
+                            ",".join(self.metrics.gpu_ids) or "unknown")
+            except Exception:  # serving matters more than metrics
+                logger.exception("Could not start the metrics endpoint; vllm:* metrics are not scraped")
         self.tracer = _tracer(otlp_endpoint)
         if otlp_endpoint:
             logger.info("Tracing requests to %s as service %s", otlp_endpoint, TRACE_SERVICE)
@@ -302,9 +417,13 @@ class LLMServer:
     # ----------------------------------------------------------------- helpers
     async def _handle(self, request: Request, chat: bool):
         route = "/v1/chat/completions" if chat else "/v1/completions"
+        on_finish = None
+        if self.metrics is not None:
+            self.metrics.request(route)
+            on_finish = lambda status: self.metrics.response(route, status)
         rt = RequestTrace(self.tracer, route, request.headers, {
             "http.request.method": "POST", "http.route": route, "gen_ai.system": "vllm",
-            "gen_ai.request.model": self.model_name, "llm.replica": self.replica})
+            "gen_ai.request.model": self.model_name, "llm.replica": self.replica}, on_finish)
         status, error, streaming = 200, None, False
         try:
             body = await self._read_body(request)
@@ -469,8 +588,10 @@ def build_app(args: Dict[str, Any]) -> serve.Application:
     """Application builder referenced by the Serve config.
 
     args: model, served_model_name, num_replicas, max_ongoing_requests,
-    engine_args (keyword arguments for vLLM's AsyncEngineArgs) and otlp_endpoint
-    (OTLP/gRPC collector for request traces; empty turns tracing off).
+    engine_args (keyword arguments for vLLM's AsyncEngineArgs), otlp_endpoint
+    (OTLP/gRPC collector for request traces; empty turns tracing off) and
+    metrics_port_base (first port of the replicas' metrics endpoints; 0 turns
+    them off).
     """
     model = args["model"]
     served_model_name = args.get("served_model_name") or model
@@ -487,8 +608,10 @@ def build_app(args: Dict[str, Any]) -> serve.Application:
             "placement_group_strategy": "STRICT_PACK",
         }
 
+    max_ongoing = int(args.get("max_ongoing_requests", 64))
     return LLMServer.options(
         num_replicas=int(args.get("num_replicas", 1)),
-        max_ongoing_requests=int(args.get("max_ongoing_requests", 64)),
+        max_ongoing_requests=max_ongoing,
         **placement,
-    ).bind(model, served_model_name, engine_args, args.get("otlp_endpoint") or "")
+    ).bind(model, served_model_name, engine_args, args.get("otlp_endpoint") or "",
+           int(args.get("metrics_port_base") or 0), max_ongoing)

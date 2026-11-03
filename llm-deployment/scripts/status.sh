@@ -33,6 +33,20 @@ for name, app in apps.items():
             print("    " + dep["message"].strip().replace("\n", "\n    "))
 ' <<<"$details"
 
+log "vLLM metrics endpoints (Prometheus job 'vllm'; scrape health, not readiness)"
+targets="$(curl -sf --max-time 10 "http://$HEAD:9090/api/v1/query" --data-urlencode 'query=up{job="vllm"}')" \
+  && "$PYTHON" -c '
+import json, os, sys
+names = dict(p.split("=", 1) for p in os.environ.get("NODE_MAP", "").split())
+rows = json.load(sys.stdin)["data"]["result"]
+if not rows:
+    print("  none discovered (no replicas yet, or deploy.sh has not set up scraping)")
+for r in sorted(rows, key=lambda r: r["metric"].get("instance", "")):
+    m = r["metric"]
+    print("  %-22s %-9s GPU %-2s %s" % (m.get("instance"), names.get(m.get("private_ip"), "?"), m.get("gpu_slot", "?"),
+                                       "scraped" if r["value"][1] == "1" else "SCRAPE FAILING"))
+' <<<"$targets" || warn "Prometheus at http://$HEAD:9090 is not answering"
+
 API="$(api_url)"
 log "API $API/v1"
 if models="$(curl -sf --max-time 10 "$API/v1/models")"; then

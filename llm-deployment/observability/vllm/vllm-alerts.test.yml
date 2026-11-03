@@ -1,0 +1,187 @@
+# promtool unit tests for vllm-alerts.yml.tmpl, rendered with the default thresholds
+# (scripts/render_alerts.py --defaults-only > vllm-alerts.defaults.yml). Run by
+# ./scripts/check-metrics.sh --static. Assertions use the ALERTS series, so they
+# check which alerts fire and their labels, not the annotation wording.
+rule_files: [vllm-alerts.defaults.yml]
+evaluation_interval: 1m
+
+tests:
+  # Scrape health: fires after 2m of up == 0, not before; a healthy target never fires.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="vllm", instance="10.0.0.11:8300", application="llm", gpu_slot="0"}'
+        values: '1 0x10'
+      - series: 'up{job="vllm", instance="10.0.0.12:8300", application="llm", gpu_slot="0"}'
+        values: '1x10'
+    promql_expr_test:
+      - expr: ALERTS{alertname="VLLMMetricsTargetDown", alertstate="firing"}
+        eval_time: 2m
+        exp_samples: []
+      - expr: ALERTS{alertname="VLLMMetricsTargetDown", alertstate="firing"}
+        eval_time: 4m
+        exp_samples:
+          - labels: 'ALERTS{alertname="VLLMMetricsTargetDown", alertstate="firing", severity="warning", job="vllm", instance="10.0.0.11:8300", application="llm", gpu_slot="0"}'
+            value: 1
+
+  # Serve RUNNING replicas vs answering endpoints, including an app with no endpoint at all.
+  - interval: 1m
+    input_series:
+      - series: 'llm_sd_replicas{application="a", deployment="LLMServer", state="RUNNING"}'
+        values: '2x10'
+      - series: 'up{job="vllm", instance="10.0.0.11:8300", application="a"}'
+        values: '1x10'
+      - series: 'up{job="vllm", instance="10.0.0.12:8300", application="a"}'
+        values: '0x10'
+      - series: 'llm_sd_replicas{application="b", deployment="LLMServer", state="RUNNING"}'
+        values: '1x10'
+      - series: 'llm_sd_replicas{application="c", deployment="LLMServer", state="RUNNING"}'
+        values: '1x10'
+      - series: 'up{job="vllm", instance="10.0.0.13:8300", application="c"}'
+        values: '1x10'
+    promql_expr_test:
+      - expr: ALERTS{alertname="VLLMReplicasWithoutMetrics", alertstate="firing"}
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="VLLMReplicasWithoutMetrics", alertstate="firing", severity="warning", application="a"}'
+            value: 1
+          - labels: 'ALERTS{alertname="VLLMReplicasWithoutMetrics", alertstate="firing", severity="warning", application="b"}'
+            value: 1
+
+  # Readiness from Serve: stuck STARTING fires after 15m; a normal 10-minute model load doesn't.
+  - interval: 1m
+    input_series:
+      - series: 'llm_sd_replicas{application="llm", deployment="LLMServer", state="STARTING"}'
+        values: '1x20'
+      - series: 'llm_sd_replicas{application="ok", deployment="LLMServer", state="STARTING"}'
+        values: '1x10 0x10'
+    promql_expr_test:
+      - expr: ALERTS{alertname="VLLMServeReplicasNotRunning", alertstate="firing"}
+        eval_time: 17m
+        exp_samples:
+          - labels: 'ALERTS{alertname="VLLMServeReplicasNotRunning", alertstate="firing", severity="warning", application="llm", deployment="LLMServer", state="STARTING"}'
+            value: 1
+
+  # Discovery down, or up but no longer completing rounds.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="vllm-sd", instance="127.0.0.1:9465"}'
+        values: '0x10'
+    promql_expr_test:
+      - expr: ALERTS{alertname="VLLMMetricsDiscoveryStale", alertstate="firing"}
+        eval_time: 4m
+        exp_samples:
+          - labels: 'ALERTS{alertname="VLLMMetricsDiscoveryStale", alertstate="firing", severity="warning", job="vllm-sd", instance="127.0.0.1:9465"}'
+            value: 1
+  - interval: 1m
+    input_series:
+      - series: 'up{job="vllm-sd", instance="127.0.0.1:9465"}'
+        values: '1x10'
+      - series: 'llm_sd_last_success_timestamp_seconds{job="vllm-sd", instance="127.0.0.1:9465", application="llm"}'
+        values: '0x10'   # stuck at t=0
+    promql_expr_test:
+      - expr: ALERTS{alertname="VLLMMetricsDiscoveryStale", alertstate="firing"}
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="VLLMMetricsDiscoveryStale", alertstate="firing", severity="warning", job="vllm-sd", instance="127.0.0.1:9465", application="llm"}'
+            value: 1
+
+  # Sustained queue on one replica; a short burst and a small queue don't fire.
+  - interval: 1m
+    input_series:
+      - series: 'vllm:num_requests_waiting{job="vllm", instance="10.0.0.11:8300", application="llm", model_name="m"}'
+        values: '20x10'
+      - series: 'vllm:num_requests_waiting{job="vllm", instance="10.0.0.12:8300", application="llm", model_name="m"}'
+        values: '30 30 0x8'
+      - series: 'vllm:num_requests_waiting{job="vllm", instance="10.0.0.13:8300", application="llm", model_name="m"}'
+        values: '5x10'
+    promql_expr_test:
+      - expr: ALERTS{alertname="VLLMQueueBuildup", alertstate="firing"}
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="VLLMQueueBuildup", alertstate="firing", severity="warning", instance="10.0.0.11:8300", application="llm", model_name="m"}'
+            value: 1
+
+  # Preemptions: 6/min = 0.1/s for 20 minutes on one replica.
+  - interval: 1m
+    input_series:
+      - series: 'vllm:num_preemptions_total{job="vllm", instance="10.0.0.11:8300", application="llm", model_name="m"}'
+        values: '0+6x20'
+      - series: 'vllm:num_preemptions_total{job="vllm", instance="10.0.0.12:8300", application="llm", model_name="m"}'
+        values: '0x20'
+    promql_expr_test:
+      - expr: ALERTS{alertname="VLLMPreemptions", alertstate="firing"}
+        eval_time: 17m
+        exp_samples:
+          - labels: 'ALERTS{alertname="VLLMPreemptions", alertstate="firing", severity="warning", instance="10.0.0.11:8300", application="llm", model_name="m"}'
+            value: 1
+
+  # Fleet TTFT p95 from summed buckets. Replica A is slow (every request in (2.5, 5]),
+  # replica B fast (<= 0.1s), 1 request/s each. Summed buckets: 120/min in total, 60 of
+  # them <= 2.5s, so p95 = 2.5 + (114 - 60) / 60 * 2.5 = 4.75s > 2s: fires.
+  # App "quiet" has the same latencies at 1 request/min (< 0.05/s): stays quiet.
+  # App "idle" had no requests at all (flat counters, p95 = NaN): stays quiet.
+  - interval: 1m
+    input_series:
+      - series: 'vllm:time_to_first_token_seconds_bucket{job="vllm", instance="A", application="llm", model_name="m", le="0.1"}'
+        values: '0x20'
+      - series: 'vllm:time_to_first_token_seconds_bucket{job="vllm", instance="A", application="llm", model_name="m", le="2.5"}'
+        values: '0x20'
+      - series: 'vllm:time_to_first_token_seconds_bucket{job="vllm", instance="A", application="llm", model_name="m", le="5"}'
+        values: '0+60x20'
+      - series: 'vllm:time_to_first_token_seconds_bucket{job="vllm", instance="A", application="llm", model_name="m", le="+Inf"}'
+        values: '0+60x20'
+      - series: 'vllm:time_to_first_token_seconds_count{job="vllm", instance="A", application="llm", model_name="m"}'
+        values: '0+60x20'
+      - series: 'vllm:time_to_first_token_seconds_bucket{job="vllm", instance="B", application="llm", model_name="m", le="0.1"}'
+        values: '0+60x20'
+      - series: 'vllm:time_to_first_token_seconds_bucket{job="vllm", instance="B", application="llm", model_name="m", le="2.5"}'
+        values: '0+60x20'
+      - series: 'vllm:time_to_first_token_seconds_bucket{job="vllm", instance="B", application="llm", model_name="m", le="5"}'
+        values: '0+60x20'
+      - series: 'vllm:time_to_first_token_seconds_bucket{job="vllm", instance="B", application="llm", model_name="m", le="+Inf"}'
+        values: '0+60x20'
+      - series: 'vllm:time_to_first_token_seconds_count{job="vllm", instance="B", application="llm", model_name="m"}'
+        values: '0+60x20'
+      - series: 'vllm:time_to_first_token_seconds_bucket{job="vllm", instance="Q", application="quiet", model_name="m", le="2.5"}'
+        values: '0x20'
+      - series: 'vllm:time_to_first_token_seconds_bucket{job="vllm", instance="Q", application="quiet", model_name="m", le="5"}'
+        values: '0+1x20'
+      - series: 'vllm:time_to_first_token_seconds_bucket{job="vllm", instance="Q", application="quiet", model_name="m", le="+Inf"}'
+        values: '0+1x20'
+      - series: 'vllm:time_to_first_token_seconds_count{job="vllm", instance="Q", application="quiet", model_name="m"}'
+        values: '0+1x20'
+      - series: 'vllm:time_to_first_token_seconds_bucket{job="vllm", instance="I", application="idle", model_name="m", le="5"}'
+        values: '7x20'
+      - series: 'vllm:time_to_first_token_seconds_bucket{job="vllm", instance="I", application="idle", model_name="m", le="+Inf"}'
+        values: '7x20'
+      - series: 'vllm:time_to_first_token_seconds_count{job="vllm", instance="I", application="idle", model_name="m"}'
+        values: '7x20'
+    promql_expr_test:
+      - expr: histogram_quantile(0.95, sum by (application, le) (rate(vllm:time_to_first_token_seconds_bucket{application="llm"}[5m])))
+        eval_time: 10m
+        exp_samples:
+          - labels: '{application="llm"}'
+            value: 4.75
+      - expr: ALERTS{alertname="VLLMHighTimeToFirstToken", alertstate="firing"}
+        eval_time: 17m
+        exp_samples:
+          - labels: 'ALERTS{alertname="VLLMHighTimeToFirstToken", alertstate="firing", severity="warning", application="llm", model_name="m"}'
+            value: 1
+
+  # Inter-token latency: every token in (0.3, 0.5] at 10 tokens/s, 1 request/s.
+  - interval: 1m
+    input_series:
+      - series: 'vllm:time_per_output_token_seconds_bucket{job="vllm", instance="A", application="llm", model_name="m", le="0.3"}'
+        values: '0x20'
+      - series: 'vllm:time_per_output_token_seconds_bucket{job="vllm", instance="A", application="llm", model_name="m", le="0.5"}'
+        values: '0+600x20'
+      - series: 'vllm:time_per_output_token_seconds_bucket{job="vllm", instance="A", application="llm", model_name="m", le="+Inf"}'
+        values: '0+600x20'
+      - series: 'vllm:time_to_first_token_seconds_count{job="vllm", instance="A", application="llm", model_name="m"}'
+        values: '0+60x20'
+    promql_expr_test:
+      - expr: ALERTS{alertname="VLLMHighInterTokenLatency", alertstate="firing"}
+        eval_time: 17m
+        exp_samples:
+          - labels: 'ALERTS{alertname="VLLMHighInterTokenLatency", alertstate="firing", severity="warning", application="llm", model_name="m"}'
+            value: 1

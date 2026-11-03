@@ -1,0 +1,157 @@
+# Prometheus alert rules for the vLLM replicas. Template: scripts/render_alerts.py replaces
+# each @@-delimited threshold name with its value from alert-thresholds.env (or the environment), and deploy.sh
+# installs the result as /opt/observability/prometheus/llm/rules/vllm-alerts.yml on the head.
+#
+# Scrape health is not inference readiness: `up` only says /metrics answered. Readiness comes
+# from Ray Serve's health checks (llm_sd_replicas, from Serve's REST API) and, end to end, from
+# a request through the API (./scripts/chat.sh, ./scripts/load-test.sh).
+#
+# There is no Alertmanager in the stack: firing alerts show in Prometheus (:9090/alerts), as
+# the ALERTS series, and in the vLLM Engine dashboard. Add an Alertmanager to get notified.
+groups:
+  - name: vllm-availability
+    rules:
+      - alert: VLLMMetricsTargetDown
+        expr: up{job="vllm"} == 0
+        for: @@VLLM_ALERT_TARGET_DOWN_FOR@@
+        labels:
+          severity: warning
+        annotations:
+          summary: "vLLM metrics endpoint {{ $labels.instance }} is not answering"
+          description: >-
+            Prometheus has failed to scrape {{ $labels.instance }} (GPU slot {{ $labels.gpu_slot }},
+            app {{ $labels.application }}) for @@VLLM_ALERT_TARGET_DOWN_FOR@@. This is scrape health
+            only: the replica may still serve requests, or may be down or restarting. Check
+            ./scripts/status.sh for the Serve replica state and ./scripts/logs.sh for
+            "metrics endpoint" errors.
+
+      - alert: VLLMReplicasWithoutMetrics
+        expr: |
+          sum by (application) (llm_sd_replicas{state="RUNNING"})
+            > (count by (application) (up{job="vllm"} == 1)
+               or sum by (application) (llm_sd_replicas{state="RUNNING"}) * 0)
+        for: @@VLLM_ALERT_MISSING_METRICS_FOR@@
+        labels:
+          severity: warning
+        annotations:
+          summary: "Some RUNNING replicas of {{ $labels.application }} have no scrapeable metrics"
+          description: >-
+            Ray Serve reports more RUNNING replicas than there are vLLM metrics endpoints answering,
+            so dashboards and alerts undercount this application. Look for "Could not start the
+            metrics endpoint" in ./scripts/logs.sh, and check the llm-metrics-sd service on the
+            head (journalctl -u llm-metrics-sd).
+
+      - alert: VLLMServeReplicasNotRunning
+        expr: sum by (application, deployment, state) (llm_sd_replicas{state!="RUNNING"}) > 0
+        for: @@VLLM_ALERT_NOT_RUNNING_FOR@@
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} replica(s) of {{ $labels.application }} stuck in {{ $labels.state }}"
+          description: >-
+            Ray Serve has reported replicas in state {{ $labels.state }} for
+            @@VLLM_ALERT_NOT_RUNNING_FOR@@: they are not serving (failed health checks, restarts,
+            or no free GPU). ./scripts/status.sh shows the Serve message; ./scripts/logs.sh the
+            vLLM traceback.
+
+      - alert: VLLMMetricsDiscoveryStale
+        expr: |
+          up{job="vllm-sd"} == 0
+            or time() - llm_sd_last_success_timestamp_seconds > 120
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "vLLM metrics discovery on the head is down or failing"
+          description: >-
+            The llm-metrics-sd service has not completed a discovery round for over 2 minutes, so
+            the vLLM target list is frozen and replica state is unknown. On the head:
+            journalctl -u llm-metrics-sd -n 50; it needs the Ray dashboard on :8265.
+
+  - name: vllm-load
+    rules:
+      - alert: VLLMQueueBuildup
+        expr: |
+          sum by (application, model_name, instance) (vllm:num_requests_waiting{job="vllm"})
+            > @@VLLM_ALERT_QUEUE_WAITING@@
+        for: @@VLLM_ALERT_QUEUE_FOR@@
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} requests waiting in vLLM's queue on {{ $labels.instance }}"
+          description: >-
+            More than @@VLLM_ALERT_QUEUE_WAITING@@ requests have waited in the scheduler queue of
+            {{ $labels.instance }} for @@VLLM_ALERT_QUEUE_FOR@@: the engine is out of batch slots
+            (max_num_seqs) or KV cache. Add replicas or GPUs, or shorten --max-model-len /
+            max_tokens so more requests fit in the KV cache.
+
+      - alert: VLLMPreemptions
+        expr: |
+          sum by (application, model_name, instance) (rate(vllm:num_preemptions_total{job="vllm"}[5m]))
+            > @@VLLM_ALERT_PREEMPTION_RATE@@
+        for: @@VLLM_ALERT_PREEMPTION_FOR@@
+        labels:
+          severity: warning
+        annotations:
+          summary: "vLLM on {{ $labels.instance }} keeps preempting requests ({{ $value | humanize }}/s)"
+          description: >-
+            Requests are evicted from the KV cache and recomputed, which wastes GPU time and
+            inflates latency. Lower --max-ongoing-requests or max_num_seqs, shorten
+            --max-model-len, raise --gpu-memory-utilization, or use a GPU with more memory.
+
+  - name: vllm-latency
+    rules:
+      - alert: VLLMHighTimeToFirstToken
+        expr: |
+          histogram_quantile(0.95,
+            sum by (application, model_name, le) (rate(vllm:time_to_first_token_seconds_bucket{job="vllm"}[5m])))
+            > @@VLLM_ALERT_TTFT_P95_SECONDS@@
+          and on (application, model_name)
+          sum by (application, model_name) (rate(vllm:time_to_first_token_seconds_count{job="vllm"}[5m]))
+            > @@VLLM_ALERT_MIN_REQUEST_RATE@@
+        for: @@VLLM_ALERT_LATENCY_FOR@@
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 time to first token of {{ $labels.model_name }} is {{ $value | humanizeDuration }}"
+          description: >-
+            Fleet p95 time to first token (all replicas' buckets summed, 5m window) has been above
+            @@VLLM_ALERT_TTFT_P95_SECONDS@@s for @@VLLM_ALERT_LATENCY_FOR@@. It is measured inside
+            vLLM, from the request entering the engine, so it includes vLLM queueing and prefill but
+            not time in Ray Serve's proxy. Check the queue and KV-cache panels.
+
+      - alert: VLLMHighInterTokenLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum by (application, model_name, le) (rate(vllm:time_per_output_token_seconds_bucket{job="vllm"}[5m])))
+            > @@VLLM_ALERT_ITL_P95_SECONDS@@
+          and on (application, model_name)
+          sum by (application, model_name) (rate(vllm:time_to_first_token_seconds_count{job="vllm"}[5m]))
+            > @@VLLM_ALERT_MIN_REQUEST_RATE@@
+        for: @@VLLM_ALERT_LATENCY_FOR@@
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 inter-token latency of {{ $labels.model_name }} is {{ $value | humanizeDuration }}"
+          description: >-
+            Fleet p95 time per output token has been above @@VLLM_ALERT_ITL_P95_SECONDS@@s for
+            @@VLLM_ALERT_LATENCY_FOR@@. Batches are large or long prefills interrupt decoding; see
+            tokens per iteration and requests running.
+
+      - alert: VLLMHighEndToEndLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum by (application, model_name, le) (rate(vllm:e2e_request_latency_seconds_bucket{job="vllm"}[5m])))
+            > @@VLLM_ALERT_E2E_P95_SECONDS@@
+          and on (application, model_name)
+          sum by (application, model_name) (rate(vllm:e2e_request_latency_seconds_count{job="vllm"}[5m]))
+            > @@VLLM_ALERT_MIN_REQUEST_RATE@@
+        for: @@VLLM_ALERT_LATENCY_FOR@@
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 end-to-end latency of {{ $labels.model_name }} is {{ $value | humanizeDuration }}"
+          description: >-
+            Fleet p95 end-to-end request latency (inside vLLM) has been above
+            @@VLLM_ALERT_E2E_P95_SECONDS@@s for @@VLLM_ALERT_LATENCY_FOR@@. It scales with output
+            length, so compare with the generation-tokens-per-request panel before acting.

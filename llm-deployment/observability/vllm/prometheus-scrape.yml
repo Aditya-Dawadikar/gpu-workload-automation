@@ -1,0 +1,29 @@
+# Merged into the head's Prometheus config (/opt/observability/prometheus/prometheus.yml,
+# rendered by gpu-workers Terraform) by remote/setup-vllm-metrics.sh: these jobs are added or
+# replaced by name and the rule_files entry is added; everything else in that file is kept.
+# /etc/prometheus/llm is /opt/observability/prometheus/llm on the head, mounted read-only.
+rule_files:
+  - /etc/prometheus/llm/rules/*.yml
+
+scrape_configs:
+  # vLLM's native metrics (vllm:*) plus llm_serve_*, from every Ray Serve replica
+  # directly: <worker private IP>:<8300 + GPU index>. Never the load-balanced
+  # Serve proxy on :8000, which would mix replicas. Targets come from
+  # remote/vllm_metrics_sd.py, with labels application, deployment, private_ip
+  # and gpu_slot; instance stays <ip>:<port>, stable for a GPU's lifetime.
+  - job_name: vllm
+    file_sd_configs:
+      - files: ["/etc/prometheus/llm/targets/*.json"]
+        refresh_interval: 30s
+    metric_relabel_configs:
+      # Its label values are lists of LoRA adapter names and its value a
+      # timestamp; this app serves no LoRA adapters, so it carries nothing.
+      - source_labels: [__name__]
+        regex: "vllm:lora_requests_info"
+        action: drop
+
+  # The discovery daemon itself: Ray Serve's replica states (llm_sd_replicas)
+  # and discovery freshness. Listens on 127.0.0.1 only.
+  - job_name: vllm-sd
+    static_configs:
+      - targets: ["127.0.0.1:9465"]

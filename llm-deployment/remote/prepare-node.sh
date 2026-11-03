@@ -17,6 +17,9 @@ WEB_PINS=(fastapi==0.115.6 starlette==0.41.3 uvicorn==0.34.0)
 # Same story for vLLM 0.6.6: transformers 5.x dropped tokenizer attributes it uses
 # (all_special_tokens_extended), so keep transformers on the 4.x line it shipped with.
 VLLM_PINS=("vllm==$VLLM_VERSION" transformers==4.47.1)
+# prometheus_client >= 0.23 rewrites vLLM's metric names on the wire (vllm:x -> vllm_x) for
+# scrapers that don't negotiate UTF-8 names, which includes Prometheus 2.x; keep vLLM's names.
+VLLM_PINS+=(prometheus_client==0.22.1)
 # OpenTelemetry for request tracing: vLLM 0.6.6 only enables otlp_traces_endpoint
 # with these importable, and was built against the 1.26 SDK.
 VLLM_PINS+=(opentelemetry-api==1.26.0 opentelemetry-sdk==1.26.0 opentelemetry-exporter-otlp==1.26.0
