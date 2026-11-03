@@ -70,10 +70,12 @@ replaces the replicas). Only **one model** is served at a time: a new deploy rep
 3. **Download**: every GPU worker fetches the model weights into `~/.cache/huggingface`,
    using the same file selection as vLLM. Problems such as a gated model or a wrong ID show up here with a clear message.
 4. **Deploy**: starts Grafana Tempo on the head for request traces, writes a Ray Serve config,
-   runs `serve deploy` on the head, and installs the **LLM Serving** Grafana dashboard.
+   runs `serve deploy` on the head, installs the **LLM Serving** and **vLLM Engine** Grafana
+   dashboards, and sets up Prometheus to scrape every replica's native vLLM metrics
+   (see [Native vLLM metrics](#native-vllm-metrics)).
 5. **Wait + verify**: follows replica states until the app is `RUNNING`, sends a test request
-   through the head, checks that `ray_llm_*` metrics reach Prometheus and traces reach Tempo,
-   and checks that the API is reachable from your machine.
+   through the head, checks that `ray_llm_*` metrics and every replica's `vllm:*` metrics reach
+   Prometheus and traces reach Tempo, and checks that the API is reachable from your machine.
 
 All output is saved to `logs/deploy-<time>.log`; per-node install and download logs
 and the generated Serve config are in `logs/deploy-<time>/`.
@@ -175,6 +177,158 @@ All of them carry `model` and `replica` labels. Ray Serve's own metrics (`ray_se
 (Grafana folder *ray*) cover the HTTP side, and the Ray dashboard's *Serve* tab (`http://<head>:8265`)
 shows replicas and their logs.
 
+## Native vLLM metrics
+
+Besides the `ray_llm_*` copies above, every replica exposes **vLLM's own Prometheus metrics** (`vllm:*`,
+exactly as vLLM defines them), and Prometheus scrapes each replica directly. The **vLLM Engine**
+dashboard (`http://<head>:3000/d/vllm-engine`, folder *llm*) and a set of alert rules use them.
+
+```
+ worker-N  replica on GPU g ──▶ <private IP>:8300+g /metrics   vllm:* + llm_serve_*   (private network only)
+                                        ▲
+ head      llm-metrics-sd ──────────────┤ every 15s: where does Ray Serve run replicas? which ports answer?
+             │ writes targets file      │
+             ▼                          │
+           Prometheus  job "vllm" ──────┘ scrapes each replica (never the load-balanced :8000)
+                       job "vllm-sd"   ◀── llm-metrics-sd's own metrics: Serve replica states
+                       rules           ──▶ alerts at :9090/alerts and on the dashboard
+```
+
+**How it works**
+
+- **In each replica**, vLLM 0.6.6 already records its metrics in the process's `prometheus_client`
+  registry, but only vLLM's own OpenAI server serves them over HTTP, and this app uses Ray Serve
+  instead. `app/llm_serve.py` serves that registry on the worker's **private IP** at port
+  `8300 + <first GPU index>`, so replicas sharing a node never collide and a GPU always keeps the same
+  port. The port isn't in the security group's operator rules, so only cluster nodes can reach it. It
+  adds a few `llm_serve_*` series (below). Set `LLM_METRICS_PORT_BASE` to move the range (8 ports).
+- **On the head**, the `llm-metrics-sd` systemd service asks Ray Serve's REST API which nodes run
+  replicas, probes those nodes' ports for a replica, and writes the targets to
+  `/opt/observability/prometheus/llm/targets/vllm.json` (Prometheus `file_sd`). Target labels are stable:
+  `instance` (`<ip>:<port>`), `application`, `deployment`, `private_ip`, `gpu_slot`. If a replica stops
+  answering, its target stays listed (so `up` goes to 0 and alerts fire) until Serve no longer has a
+  replica on that node or the target has been silent for 10 minutes.
+- **Prometheus config**: `deploy.sh` runs `remote/setup-vllm-metrics.sh`, which *merges* the `vllm` and
+  `vllm-sd` jobs and a `rule_files` entry into the head's Terraform-rendered `prometheus.yml`. It also adds a
+  read-only mount of `/opt/observability/prometheus/llm` to the `prometheus` service in
+  `docker-compose.yml`. Other jobs, services and settings are kept. The Terraform originals are saved
+  once as `*.orig`. The merged config is checked with the running Prometheus image's `promtool` before
+  anything is changed. After that, Prometheus is reloaded, or recreated the first time to add the mount;
+  its data volume is kept. Rerunning `deploy.sh` changes nothing unless a file differs.
+- Nothing in `../gpu-workers` changes. Changing its head templates would make Terraform **replace the head
+  node**, so the integration is installed by `deploy.sh`, like Tempo and the dashboards.
+
+**Metrics** (verified against the vLLM `0.6.6.post1` source, `vllm/engine/metrics.py`). All `vllm:*` series
+have the label `model_name`, which is the served name (`--name`):
+
+| Metric | Type | Used for |
+|---|---|---|
+| `vllm:num_requests_running`, `vllm:num_requests_waiting`, `vllm:num_requests_swapped` | gauge | Batch size and queue (sampled at engine steps) |
+| `vllm:request_success_total{finished_reason}` | counter | Completions |
+| `vllm:time_to_first_token_seconds`, `vllm:time_per_output_token_seconds`, `vllm:e2e_request_latency_seconds`, `vllm:request_queue_time_seconds`, `vllm:request_prefill_time_seconds`, `vllm:request_decode_time_seconds` | histogram (seconds) | Latency |
+| `vllm:prompt_tokens_total`, `vllm:generation_tokens_total` | counter | Token throughput |
+| `vllm:request_prompt_tokens`, `vllm:request_generation_tokens` | histogram (tokens) | Tokens per request |
+| `vllm:iteration_tokens_total` | histogram (tokens) | Tokens per engine iteration |
+| `vllm:gpu_cache_usage_perc` | gauge, 0–1 | KV-cache usage |
+| `vllm:num_preemptions_total` | counter | Preemptions |
+| `vllm:gpu_prefix_cache_hit_rate` | gauge, 0–1 or −1 | Prefix cache (see below) |
+| `vllm:cache_config_info` | gauge = 1 | Cache config as labels (`num_gpu_blocks`, `block_size`, …) |
+| `llm_serve_requests_received_total{route}` | counter | **Arrivals.** vLLM 0.6.6 has no arrival counter, so the app counts requests as they arrive |
+| `llm_serve_responses_total{route,code}` | counter | Responses by HTTP status (499 = client disconnected) |
+| `llm_serve_max_num_seqs`, `llm_serve_max_ongoing_requests`, `llm_serve_max_num_batched_tokens`, `llm_serve_kv_cache_capacity_tokens` | gauge | Capacity limits, for headroom panels |
+| `llm_serve_replica_info{replica_id,serve_application,serve_deployment,gpu_ids,vllm_version}` | gauge = 1 | Replica identity (read by discovery) |
+| `llm_sd_replicas{application,deployment,state}` | gauge | Replicas per state from Ray Serve (**readiness**, separate from scrape health) |
+
+Labels never carry request IDs, users, prompts or other request content. `vllm:lora_requests_info` is
+dropped at scrape time (its labels are lists of LoRA adapter names, and this app serves none).
+
+**Dashboard** (`vllm-engine`). Variables: *Serve app*, *Deployment*, *Model*, *Replica (instance)*.
+
+| Row | Panels |
+|---|---|
+| Fleet overview | Replicas scraped vs Serve RUNNING, arrivals/s, completions/s, running, waiting, p95 TTFT, generated tokens/s, max KV cache |
+| Requests | Arrivals vs completions vs errors, completions by finish reason, running and waiting per replica, responses by HTTP status |
+| Latency – fleet | TTFT, inter-token latency, end-to-end latency, queue time (p50/p90/p99 + mean), prefill vs decode p95, tokens per request |
+| Latency – per replica | p95 TTFT / inter-token / end-to-end for each replica |
+| Token throughput | Prompt + generated tokens/s (fleet), generated tokens/s per replica |
+| Engine iterations and KV cache | Tokens per iteration, batch occupancy, iterations/s, KV-cache usage, preemptions/s, swapped requests |
+| Prefix cache | Why a counter-based hit ratio isn't available in 0.6.6; the lifetime hit-rate gauge per replica |
+| Replica health and capacity | Scrape health timeline, Serve replica states, KV-cache headroom (tokens), free batch slots, Ray Serve in-flight vs limit, scrape duration, firing alerts |
+
+How to read it:
+
+- **Fleet percentiles** sum every replica's histogram buckets first and then compute the quantile once
+  (`histogram_quantile(q, sum by (le) (rate(..._bucket[...]))`). Replica percentiles are never averaged.
+  Per-replica panels compute each replica's own percentile from its own buckets.
+- **Units:** latency panels are in seconds. Arrival and completion rates are requests/s. Token rates are
+  tokens/s.
+- **No traffic** gives an empty panel ("no requests"), not 0. A rate of zero over finished requests has
+  no percentile. Gauges such as running/waiting are only updated on engine steps, so after traffic stops
+  they keep the value of the last step.
+- **Tokens per iteration is not batch size.** `vllm:iteration_tokens_total` counts the *tokens* processed
+  in one engine step: all prompt tokens being prefilled plus one per decoding sequence. A single request
+  can contribute thousands in one step. Batch size, the number of *requests*, is
+  `vllm:num_requests_running` (see the *batch occupancy* panel). The histogram's buckets are vLLM's
+  CUDA-graph batch sizes (largest usually 256), so bigger steps fall in `+Inf` and its percentiles are
+  capped at that size. The panel shows the mean, rate(sum) / rate(count), for that reason.
+- **Prefix cache hit ratio from counters is not supported by vLLM 0.6.6.post1.** It exports no prefix-cache
+  hit or query counters; those come with the V1 engine in later vLLM releases. What it has is the gauge
+  `vllm:gpu_prefix_cache_hit_rate`:
+  - It is the fraction (0–1) of KV-cache **block** lookups that hit, cumulative since the replica
+    started.
+  - It is `-1` when prefix caching is off, which is the V0 default. Turn it on with
+    `--engine-arg enable_prefix_caching=true`.
+  - It can't be weighted across replicas, so the dashboard shows it per replica, filtered to `>= 0`,
+    and never treats it as a windowed ratio.
+- **Arrivals vs completions:** arrivals are counted by the app as requests come in. Completions are
+  requests vLLM finished. Rejected requests (400/404) and client disconnects show up in the HTTP status
+  panel, not in completions.
+- **Queues you can't see here:** requests beyond `--max-ongoing-requests` per replica wait in Ray Serve
+  before reaching vLLM. vLLM's TTFT and queue time start when a request enters the engine. The *Ray Serve
+  in-flight vs limit* panel and the LLM Serving / Ray Serve dashboards show the HTTP side.
+- This is metrics only. CPU/GPU flame charts and profiler traces are a separate feature; Prometheus
+  metrics don't provide them.
+
+**Alerts** (`observability/vllm/vllm-alerts.yml.tmpl`, thresholds in `observability/vllm/alert-thresholds.env`).
+There is no Alertmanager in the stack: alerts show at `http://<head>:9090/alerts` and in the dashboard's
+*Firing vLLM alerts* table. Add an Alertmanager if you want notifications.
+
+| Alert | Fires when | Default | Tune? |
+|---|---|---|---|
+| `VLLMMetricsTargetDown` | a replica's `/metrics` fails to scrape (`up == 0`) | for 2m | no |
+| `VLLMReplicasWithoutMetrics` | Serve has more RUNNING replicas than answering endpoints | for 5m | no |
+| `VLLMServeReplicasNotRunning` | Serve reports replicas not RUNNING (failed health checks, restarts, no GPU) | for 15m | keep above your model load time |
+| `VLLMMetricsDiscoveryStale` | `llm-metrics-sd` down or failing | for 2m | no |
+| `VLLMQueueBuildup` | a replica's vLLM queue (`num_requests_waiting`) > 8 | for 5m | **yes**: workload-specific |
+| `VLLMPreemptions` | a replica preempts > 0.01 requests/s | for 10m | **yes** |
+| `VLLMHighTimeToFirstToken` | fleet p95 TTFT > 2 s, with > 0.05 req/s | for 10m | **yes**: model, GPU, prompt length |
+| `VLLMHighInterTokenLatency` | fleet p95 time per output token > 0.2 s | for 10m | **yes** |
+| `VLLMHighEndToEndLatency` | fleet p95 end-to-end > 30 s | for 10m | **yes**: scales with `max_tokens` |
+
+Scrape health is not inference readiness. `up == 1` only means `/metrics` answered: a replica can serve
+metrics while its engine fails, or serve requests while a scrape fails. Readiness comes from Ray Serve's
+health checks (`VLLMServeReplicasNotRunning`, *Serve replica states* panel) and, end to end, from a
+request (`./scripts/chat.sh`, `./scripts/load-test.sh`). Latency alerts stay quiet below the minimum request
+rate, because a few requests give a noisy p95 and none give no p95 at all. Each latency threshold must be
+below the histogram's highest bucket (TTFT 10 s, inter-token 2.5 s, end-to-end 60 s). Above that, the p95
+can't be measured, and `render_alerts.py` refuses such values.
+
+Override any threshold with an environment variable of the same name when deploying:
+
+```bash
+VLLM_ALERT_TTFT_P95_SECONDS=1 VLLM_ALERT_QUEUE_WAITING=20 ./scripts/deploy.sh
+```
+
+**Validate**:
+
+```bash
+./scripts/check-metrics.sh --static     # no cluster: promtool checks of rules (+ unit tests), scrape config, every dashboard query
+./scripts/check-metrics.sh              # live: targets, a replica's real /metrics vs vLLM 0.6.6's definitions, every query on Prometheus
+./scripts/check-metrics.sh --load 20    # live + 20 requests, then checks that request/token counters rose
+```
+
+`promtool` comes from your PATH, or from the `prom/prometheus` image if Docker is running.
+
 ## Request tracing
 
 Every request to `/v1/chat/completions` and `/v1/completions` is traced with OpenTelemetry. The replicas
@@ -222,6 +376,23 @@ your client span and the server span is the time spent in the proxy and on the n
 - **LLM dashboard is empty:** panels fill in once requests flow (run `load-test.sh`). If there is still
   nothing, check `count({__name__=~"ray_llm_.+"})` in Prometheus, the `ray` job under *Status → Targets*,
   and `./scripts/logs.sh` for "Could not attach the metrics logger".
+- **vLLM Engine dashboard empty / `vllm` targets missing:** run `./scripts/check-metrics.sh`. Then:
+  - At `http://<head>:9090/targets`, job `vllm` should list one target per replica.
+  - If it lists none, check discovery on the head: `journalctl -u llm-metrics-sd -n 50`, and
+    `cat /opt/observability/prometheus/llm/targets/vllm.json`. Discovery needs the Ray dashboard on
+    `:8265`.
+  - In `./scripts/logs.sh`, a replica logs "Serving vLLM metrics on port …" or "Could not start the
+    metrics endpoint" (e.g. the port is still held by a replica that is shutting down).
+- **`vllm` targets are up but there are no `vllm:*` series (you see `vllm_num_requests_running` etc.):**
+  `prometheus_client` 0.23+ rewrites `vllm:` to `vllm_` for Prometheus 2.x scrapers. `prepare-node.sh` pins
+  `prometheus_client==0.22.1`; rerun `deploy.sh` so the workers get it and the replicas restart.
+- **A `vllm` target is down (`up == 0`) but the API works:** the replica's metrics thread or port is the
+  problem, not inference. A replica restarted on another GPU of the same node gets a new port; the old
+  target disappears within 10 minutes.
+- **Prometheus didn't pick up the vLLM jobs:** rerun `deploy.sh`; `setup-vllm-metrics.sh` prints what it
+  changed and refuses a config `promtool` rejects. To undo the merge on the head, restore
+  `/opt/observability/prometheus/prometheus.yml.orig` and `docker-compose.yml.orig`, then run
+  `docker compose up -d prometheus` in `/opt/observability`.
 - **No traces in Tempo:** `./scripts/logs.sh worker-0` should show "Tracing requests to http://…:4317";
   OpenTelemetry export errors show up there too. On the head, `docker logs llm-tempo` shows Tempo itself.
 
@@ -232,5 +403,11 @@ your client span and the server span is the time spent in the proxy and on the n
 - **No authentication on the API.** Only the `allowed_cidrs` from gpu-workers can reach it, so
   keep that list tight.
 - Text only: image inputs, tool calls and logprobs are not implemented.
-- The LLM Serving dashboard and Tempo live on the head's disk, so a rebuilt head loses them (and the
-  stored traces) until the next `deploy.sh`.
+- The LLM Serving and vLLM Engine dashboards, Tempo, the vLLM scrape jobs, alert rules and
+  `llm-metrics-sd` live on the head's disk, so a rebuilt head loses them (and the stored traces) until
+  the next `deploy.sh`.
+- vLLM metrics are those of vLLM `0.6.6.post1`. It has no prefix-cache hit/query counters and no
+  request-arrival counter (the app adds one), and `vllm:iteration_tokens_total` percentiles are capped at
+  its largest bucket. A different `--vllm-version` may rename or add metrics: run
+  `./scripts/check-metrics.sh`, which compares a replica's real `/metrics` with what the dashboard uses.
+- No Alertmanager: alerts are visible in Prometheus and Grafana, but not sent anywhere.

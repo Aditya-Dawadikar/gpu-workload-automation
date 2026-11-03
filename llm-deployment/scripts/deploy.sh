@@ -21,6 +21,8 @@ SKIP_DOWNLOAD=0
 TIMEOUT_MIN=40
 TRACING=1
 TEMPO_IMAGE="${TEMPO_IMAGE:-grafana/tempo:2.6.1}"
+# Replicas serve vLLM's metrics on <worker private IP>:<base + GPU index>.
+METRICS_PORT_BASE="${LLM_METRICS_PORT_BASE:-8300}"
 ENGINE_ARGS=()
 
 usage() {
@@ -91,6 +93,8 @@ SERVED_NAME="${SERVED_NAME:-$MODEL}"
 [[ $TIMEOUT_MIN =~ ^[1-9][0-9]*$ ]] || die "--timeout must be a positive integer"
 [[ $GPU_MEM =~ ^0?\.[0-9]+$|^1(\.0+)?$ ]] || die "--gpu-memory-utilization must be between 0 and 1"
 case "$DTYPE" in auto|half|float16|bfloat16|float32) ;; *) die "Invalid --dtype: $DTYPE" ;; esac
+[[ $METRICS_PORT_BASE =~ ^[1-9][0-9]{3,4}$ ]] && [ "$METRICS_PORT_BASE" -le 65528 ] \
+  || die "LLM_METRICS_PORT_BASE must be a port number (the 8 ports from it are used)"
 
 HF_TOKEN_VALUE="${HF_TOKEN:-}"
 if [ -n "$HF_TOKEN_FILE" ]; then
@@ -142,6 +146,8 @@ fi
 
 log "Plan: $MODEL as '$SERVED_NAME', $REPLICAS replica(s) x $TP GPU, dtype $DTYPE, context $([ "$MAX_MODEL_LEN" = 0 ] && echo "model default" || echo "$MAX_MODEL_LEN"), vLLM $VLLM_VERSION"
 [ -n "$HF_TOKEN_VALUE" ] && log "Using a Hugging Face token" || true
+# Alert thresholds: observability/vllm/alert-thresholds.env, overridden by VLLM_ALERT_* variables.
+"$PYTHON" "$LLM_DIR/scripts/render_alerts.py" >"$RUN_DIR/vllm-alerts.yml" || die "Invalid vLLM alert thresholds (see above)"
 
 # ---------------------------------------------------------------------------
 phase 2 "Install Ray Serve + vLLM on the nodes (first run: ~5 min)"
@@ -217,7 +223,7 @@ CONFIG="$RUN_DIR/serve-config.yaml"
 APP_SHA="$(cat "$LLM_DIR/app/llm_serve.py" "$LLM_DIR/remote/prepare-node.sh" \
   | "$PYTHON" -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:12])')"
 export MODEL SERVED_NAME REVISION TP DTYPE GPU_MEM MAX_MODEL_LEN TRUST_REMOTE_CODE \
-  REPLICAS MAX_ONGOING SERVE_APP SERVE_PORT APP_SHA OTLP_ENDPOINT
+  REPLICAS MAX_ONGOING SERVE_APP SERVE_PORT APP_SHA OTLP_ENDPOINT METRICS_PORT_BASE
 "$PYTHON" - ${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"} >"$CONFIG" <<'EOF'
 import json, os, sys
 
@@ -255,6 +261,7 @@ config = {
             "num_replicas": int(e["REPLICAS"]),
             "max_ongoing_requests": int(e["MAX_ONGOING"]),
             "otlp_endpoint": e["OTLP_ENDPOINT"],
+            "metrics_port_base": int(e["METRICS_PORT_BASE"]),
             "engine_args": engine,
         },
     }],
@@ -268,9 +275,22 @@ hssh "$REMOTE_VENV/bin/serve deploy ~/$REMOTE_DIR/serve-config.yaml --address ht
 log "Serve config saved to $CONFIG"
 
 # Grafana on the head loads new dashboard files from this directory within 30s.
-log "Installing the LLM Serving dashboard in Grafana"
-scp -q "${SSH_OPTS[@]}" "$LLM_DIR/observability/llm-serving.json" "ubuntu@$HEAD:$REMOTE_DIR/"
-hssh "sudo install -D -m 644 ~/$REMOTE_DIR/llm-serving.json /opt/observability/grafana/dashboards/llm/llm-serving.json"
+log "Installing the LLM Serving and vLLM Engine dashboards in Grafana"
+scp -q "${SSH_OPTS[@]}" "$LLM_DIR/observability/llm-serving.json" "$LLM_DIR/observability/vllm-engine.json" "ubuntu@$HEAD:$REMOTE_DIR/"
+for dashboard in llm-serving vllm-engine; do
+  hssh "sudo install -D -m 644 ~/$REMOTE_DIR/$dashboard.json /opt/observability/grafana/dashboards/llm/$dashboard.json"
+done
+
+# Scrape vLLM's native metrics from every replica: target discovery, scrape
+# jobs and alert rules in the head's Prometheus. Serving doesn't depend on it.
+log "Configuring Prometheus to scrape every replica's vLLM metrics"
+VLLM_METRICS=1
+hssh "mkdir -p ~/$REMOTE_DIR/vllm-metrics ~/$REMOTE_DIR/bin"
+scp -q "${SSH_OPTS[@]}" "$LLM_DIR/remote/setup-vllm-metrics.sh" "ubuntu@$HEAD:$REMOTE_DIR/bin/"
+scp -q "${SSH_OPTS[@]}" "$LLM_DIR/remote/vllm_metrics_sd.py" "$LLM_DIR/observability/vllm/prometheus-scrape.yml" \
+  "$RUN_DIR/vllm-alerts.yml" "ubuntu@$HEAD:$REMOTE_DIR/vllm-metrics/"
+hssh "bash ~/$REMOTE_DIR/bin/setup-vllm-metrics.sh '$SERVE_APP' '$METRICS_PORT_BASE'" 2>&1 | sed 's/^/  /' \
+  || { VLLM_METRICS=0; warn "Could not set up vLLM metrics scraping (serving is not affected). Fix the error above and rerun deploy.sh"; }
 
 # ---------------------------------------------------------------------------
 phase 5 "Wait for the model to load"
@@ -332,6 +352,23 @@ else
   warn "No ray_llm_* metrics in Prometheus after 2 min. Check ./scripts/logs.sh for 'metrics logger' errors and http://$HEAD:9090/targets (job 'ray')"
 fi
 
+if [ "$VLLM_METRICS" = 1 ]; then
+  # Discovery runs every 15s, and each endpoint starts once its replica's vLLM has loaded.
+  log "Checking that every replica's vLLM metrics reach Prometheus (up to 2 min)"
+  scraped="" vllm_series=""
+  for _ in $(seq 1 12); do
+    scraped="$(prom_scalar "sum(up{job=\"vllm\", application=\"$SERVE_APP\"})")"
+    vllm_series="$(prom_scalar "count({__name__=~\"vllm:.+\", job=\"vllm\", application=\"$SERVE_APP\"})")"
+    if [ "${scraped%.*}" = "$REPLICAS" ] && [ -n "$vllm_series" ]; then break; fi
+    sleep 10
+  done
+  if [ "${scraped%.*}" = "$REPLICAS" ] && [ -n "$vllm_series" ]; then
+    log "Prometheus scrapes $REPLICAS/$REPLICAS replica(s): $vllm_series vllm:* series"
+  else
+    warn "Prometheus scrapes ${scraped:-0}/$REPLICAS replica(s) after 2 min. Check http://$HEAD:9090/targets (job 'vllm'), ./scripts/check-metrics.sh, and ./scripts/logs.sh for 'metrics endpoint'"
+  fi
+fi
+
 TRACE_ID=""
 if [ "$TRACING" = 1 ]; then
   # Spans leave the replica in batches every ~5s; Tempo makes them searchable soon after.
@@ -367,6 +404,7 @@ cat <<EOF
 
   OpenAI base URL  $API/v1$([ "$REACHABLE" = 1 ] || echo "   (not reachable from here yet, see above)")
   LLM dashboard    http://$HEAD:3000/d/llm-serving   (throughput, latency, KV cache, GPUs, recent traces)
+  vLLM dashboard   http://$HEAD:3000/d/vllm-engine   (native vllm:* metrics, fleet + per replica; alerts at :9090/alerts)
   Request traces   $([ "$TRACING" = 1 ] && echo "Grafana > Explore > Tempo; every response has an X-Trace-Id header" || echo "off (--no-tracing)")
   Ray dashboard    http://$HEAD:$DASHBOARD_PORT/#/serve
 

@@ -116,6 +116,7 @@ It prints successes, requests/s, tokens/s and p50/p95 latency, and exits non-zer
 | Dashboard | URL | What it shows |
 |---|---|---|
 | **LLM Serving** | `http://<head>:3000/d/llm-serving` | Tokens/s, requests/s by status, time to first token, time per output token, end-to-end latency, running/waiting requests, KV-cache usage, preemptions, plus GPU utilization and memory |
+| **vLLM Engine** | `http://<head>:3000/d/vllm-engine` | vLLM's native `vllm:*` metrics scraped from every replica: fleet and per-replica latency percentiles, arrivals vs completions, tokens per iteration, KV and prefix cache, scrape health vs Serve readiness, capacity headroom, firing alerts |
 | **GPU Cluster Overview** | `http://<head>:3000` | Per-GPU utilization, memory, power and temperature; host CPU, memory, network; Ray tasks |
 | Ray Serve (folder *ray*) | `http://<head>:3000` | Ray Serve's built-in HTTP request, latency and replica dashboards |
 | Ray dashboard | `http://<head>:8265` | *Serve* tab: replicas and their logs; *Cluster* tab: nodes and GPUs |
@@ -124,7 +125,9 @@ The Grafana admin password is printed by `terraform -chdir=gpu-workers/terraform
 Anonymous visitors from `allowed_cidrs` get read-only access.
 
 The LLM metrics come from the vLLM engine inside each replica. They're exported as `ray_llm_*` series
-through Ray's metrics agent, which Prometheus already scrapes. While the load test runs you should see
+through Ray's metrics agent, which Prometheus already scrapes. vLLM's own `vllm:*` metrics are also
+scraped from each replica directly (private network only), with alert rules at `http://<head>:9090/alerts`;
+see [Native vLLM metrics](llm-deployment/README.md#native-vllm-metrics). While the load test runs you should see
 tokens/s and GPU utilization rise, and requests start waiting once the batch or KV cache fills.
 
 ### 6. Clean up
